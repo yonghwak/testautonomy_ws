@@ -1,3 +1,4 @@
+cat > ~/kaboat_ws/src/kaboat_camera/kaboat_camera/camera_node.py << 'EOF'
 import math
 import json
 import rclpy
@@ -12,27 +13,23 @@ import numpy as np
 
 class CameraNode(Node):
     """
-    ZED2i 카메라 - 완전 심플 버전.
-    색 마스크 -> 컨투어 -> 꼭짓점 개수로만 모양 판별. 그 외 아무것도 없음.
-    빨강이 안 잡히는 문제 원인 파악을 위해 각 색의 마스크를 그대로
-    'camera/mask_R', 'camera/mask_G', 'camera/mask_B', 'camera/mask_W'로
-    발행 - rosboard로 직접 눈으로 확인 가능 (전부 까맣게 나오면 색 자체가
-    안 잡히는 것, 흰 덩어리가 있는데 detections에 없으면 그다음 단계 문제).
+    ZED2i 카메라 - 색+모양+거리+좌우판정까지 인식해서 camera/detections(JSON)로 발행.
+    각 색의 마스크도 그대로 'camera/mask_R' 등으로 발행 - rosboard로 확인 가능.
 
-    W(흰색)는 mission_4 규정(흰색 부표 = 반시계 선회)용으로 추가됨.
-    채도(S) 낮고 명도(V) 높은 영역으로 판정 - 조명 환경에 따라 S_MAX/V_MIN
-    실측 튜닝 필요 (형광등/야외 직사광선에서 값이 달라질 수 있음).
+    모양 판별: 삼각형/네모/십자는 꼭짓점개수 기반. 원형은 까다롭게 검증
+    (circularity + fill_ratio 둘 다 통과해야 함) - 안 그러면 노이즈 덩어리가
+    다 원형으로 오판정됨.
+
+    좌/중/우(zone): 화면을 가로로 3등분해서 물체 중심 x좌표 기준으로 판정
+    (각도 기반보다 훨씬 직관적이고 중앙 판정 편향 없음).
     """
 
-    # 빨강은 HSV 색상환 양끝(0근처, 180근처)에 걸쳐있어 두 범위를 따로 두고
-    # OR로 합쳐 씀. 나머지는 단일 범위.
     COLOR_RANGES = {
         'G': ((35, 80, 60), (85, 255, 255)),
         'B': ((100, 100, 100), (130, 255, 255)),
-        # TODO: 실측 후 조정. 흰색 부표 특성상 하이라이트로 과포화되는
-        # 경우가 많아 V_MIN을 너무 낮게 잡으면 회색 배경/파도까지 같이
-        # 잡힐 수 있음 - 현장에서 mask_W 이미지 보면서 조정할 것.
-        'W': ((0, 0, 180), (180, 40, 255)),
+        'W': ((0, 0, 190), (180, 40, 255)),
+        'O': ((13, 120, 70), (20, 255, 255)),
+        'Y': ((21, 100, 100), (33, 255, 255)),
     }
     RED_RANGES = [
         ((0, 70, 60), (12, 255, 255)),
@@ -40,15 +37,25 @@ class CameraNode(Node):
     ]
 
     HORIZONTAL_FOV_DEG = 100.0
-    MIN_PIXEL_COUNT = 80
+    MIN_PIXEL_COUNT = 1500
+    CIRCLE_MIN_CIRCULARITY = 0.78
+    CIRCLE_MIN_FILL_RATIO = 0.78
 
     RGB_TOPIC = '/zed/zed_node/rgb/color/rect/image'
     DEPTH_TOPIC = '/zed/zed_node/depth/depth_registered'
 
-    DEBUG_COLORS_BGR = {'R': (0, 0, 255), 'G': (0, 255, 0), 'B': (255, 0, 0), 'W': (255, 255, 255)}
+    DEBUG_COLORS_BGR = {
+        'R': (0, 0, 255), 'G': (0, 255, 0), 'B': (255, 0, 0), 'W': (255, 255, 255),
+        'O': (0, 140, 255), 'Y': (0, 255, 255),
+    }
 
     def __init__(self):
         super().__init__('camera_node')
+
+        self.declare_parameter('target_color', '')
+        self.declare_parameter('target_shape', '')
+        self.target_color = self.get_parameter('target_color').value.upper()
+        self.target_shape = self.get_parameter('target_shape').value.lower()
 
         self.bridge = CvBridge()
         self.latest_depth = None
@@ -62,11 +69,13 @@ class CameraNode(Node):
         self.debug_pub = self.create_publisher(Image, 'camera/debug_image', 10)
         self.mask_pubs = {
             c: self.create_publisher(Image, f'camera/mask_{c}', 10)
-            for c in ['R', 'G', 'B', 'W']
+            for c in ['R', 'G', 'B', 'W', 'O', 'Y']
         }
 
         self.get_logger().info(
-            f'카메라 노드 시작 - 완전심플버전 (등록색={["R"] + list(self.COLOR_RANGES.keys())})')
+            f'카메라 노드 시작 (등록색={list(self.COLOR_RANGES.keys()) + ["R"]})')
+        if self.target_color and self.target_shape:
+            self.get_logger().info(f'타겟 지정: {self.target_color}/{self.target_shape}')
 
     def depth_cb(self, msg):
         try:
@@ -86,20 +95,16 @@ class CameraNode(Node):
         debug_frame = frame.copy()
         detections = []
 
-        # 빨강: 두 범위를 OR로 합침
         red_mask1 = cv2.inRange(hsv, np.array(self.RED_RANGES[0][0]), np.array(self.RED_RANGES[0][1]))
         red_mask2 = cv2.inRange(hsv, np.array(self.RED_RANGES[1][0]), np.array(self.RED_RANGES[1][1]))
         all_masks = {'R': cv2.bitwise_or(red_mask1, red_mask2)}
         for color_name, (lower, upper) in self.COLOR_RANGES.items():
             all_masks[color_name] = cv2.inRange(hsv, np.array(lower), np.array(upper))
 
-        kernel = np.ones((3, 3), np.uint8)
-        kernel_g = np.ones((5, 5), np.uint8)   # 초록은 경계가 특히 지저분해서 더 세게
+        kernel = np.ones((5, 5), np.uint8)
         for color_name, mask in all_masks.items():
-            # 마스크 다듬기: 경계 노이즈(톱니현상) 줄여서 컨투어를 안정화
-            k = kernel_g if color_name == 'G' else kernel
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
             self.publish_mask(color_name, mask)
 
@@ -118,39 +123,24 @@ class CameraNode(Node):
 
                 distance = self.get_depth_at(int(cx), int(cy))
                 angle = self.pixel_to_angle(cx, w)
+                zone = self.pixel_to_zone(cx, w)
 
-                perimeter = cv2.arcLength(contour, True)
-                # 작은 물체는 둘레도 작아서 상대오차(0.02*perimeter)만 쓰면
-                # 경계노이즈를 잘 못 지움 (실측 확인됨). 최소 절대 픽셀(3px)을
-                # 같이 강제해서 작은 물체도 충분히 다듬음.
-                # (초록만 v가 잘 안 떨어지는 문제는 아직 미해결 - 다음에 재시도)
-                epsilon = max(0.02 * perimeter, 3.0)
-                approx = cv2.approxPolyDP(contour, epsilon, True)
-                vertices = len(approx)
-                compactness = area / (perimeter * perimeter) if perimeter > 0 else 0
+                shape = self.classify_shape(contour, area)
+                if shape is None:
+                    continue  # 노이즈로 보고 아예 detections에 안 넣음
 
-                if vertices == 3:
-                    shape = 'triangle'
-                elif vertices == 4:
-                    # v=4는 진짜 사각형이거나, 삼각형이 뭉툭하게 잡힌 경우 둘 다 있음.
-                    # compactness(면적/둘레^2)로 재구분 - 실측 기준 삼각형은
-                    # ~0.03~0.04, 사각형은 그보다 높게 나옴 (경계값 0.055, 실측+이론 종합).
-                    if compactness < 0.055:
-                        shape = 'triangle'
-                    else:
-                        shape = 'square'
-                elif vertices in (11, 12, 13):
-                    shape = 'cross'    # 십자가는 꼭짓점 12개 근처 (실측 확인됨)
-                else:
-                    shape = 'circle'   # 나머지(5~10, 14+)는 원
+                is_target = bool(
+                    self.target_color and self.target_shape
+                    and color_name == self.target_color and shape == self.target_shape
+                )
 
                 det = {
                     'color': color_name,
                     'angle': round(angle, 4),
+                    'zone': zone,
+                    'is_target': is_target,
                     'shape': shape,
-                    'vertices': vertices,
                     'area': int(area),
-                    'compactness': round(compactness, 5),
                 }
                 if distance is not None:
                     det['distance'] = round(distance, 3)
@@ -160,7 +150,7 @@ class CameraNode(Node):
                 cv2.drawContours(debug_frame, [contour], -1, color_bgr, 2)
                 cv2.drawMarker(debug_frame, (int(cx), int(cy)),
                                 (255, 0, 0), cv2.MARKER_CROSS, 20, 2)
-                label = f'{color_name}:{shape}({vertices}) area={int(area)}'
+                label = f'{color_name}:{shape} {zone} area={int(area)}'
                 cv2.putText(debug_frame, label, (int(cx) - 40, int(cy) - 15),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_bgr, 1)
 
@@ -168,6 +158,34 @@ class CameraNode(Node):
         out.data = json.dumps(detections)
         self.detections_pub.publish(out)
         self.publish_debug_image(debug_frame)
+
+    def classify_shape(self, contour, area):
+        """삼각형/네모/십자는 꼭짓점개수, 원형은 circularity+fill_ratio 둘 다 통과해야 인정.
+        뭐에도 확실히 안 맞으면 None(노이즈로 보고 무시)."""
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter == 0:
+            return None
+
+        epsilon = max(0.02 * perimeter, 3.0)
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        vertices = len(approx)
+        compactness = area / (perimeter * perimeter)
+
+        if vertices == 3:
+            return 'triangle'
+        elif vertices == 4:
+            return 'triangle' if compactness < 0.055 else 'square'
+        elif vertices in (11, 12, 13):
+            return 'cross'
+
+        circularity = 4 * math.pi * area / (perimeter * perimeter)
+        (_, _), radius = cv2.minEnclosingCircle(contour)
+        circle_area = math.pi * radius * radius
+        fill_ratio = area / circle_area if circle_area > 0 else 0.0
+
+        if circularity >= self.CIRCLE_MIN_CIRCULARITY and fill_ratio >= self.CIRCLE_MIN_FILL_RATIO:
+            return 'circle'
+        return None
 
     def get_depth_at(self, x, y):
         if self.latest_depth is None:
@@ -184,6 +202,16 @@ class CameraNode(Node):
         half_fov_rad = math.radians(self.HORIZONTAL_FOV_DEG / 2.0)
         normalized = (centroid_x / image_width) - 0.5
         return -normalized * 2.0 * half_fov_rad
+
+    def pixel_to_zone(self, centroid_x, image_width):
+        """화면 가로 3등분 기준 좌/중/우 판정."""
+        third = image_width / 3.0
+        if centroid_x < third:
+            return 'left'
+        elif centroid_x < third * 2:
+            return 'center'
+        else:
+            return 'right'
 
     def publish_mask(self, color_name, mask):
         try:
@@ -214,3 +242,4 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+EOF
