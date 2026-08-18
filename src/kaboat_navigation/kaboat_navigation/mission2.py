@@ -15,22 +15,34 @@ class Mission2(Node):
     대회 규정: 대상 부표 5m 이내에서 5초간 위치를 정지 유지해야 완료. 충돌 시
     패널티. 색상 구분 불필요(최근접 부표를 대상으로 인정).
 
-    흐름:
-      MOVING : m2s로 GPS 이동
-      TASK   : LiDAR 최근접 클러스터를 부표로 락온, 데드밴드 P제어 + 히스테리시스
-               로 5m 유지, 5초 성공시 m2e로 이동 후 done
+    흐름 (3단계 - 실측 검증 반영):
+      MOVING   : m2s로 GPS 이동
+      APPROACH : 라이다로 최근접 클러스터(부표)까지의 거리/방위 보며 접근.
+                 목표거리(TARGET_DIST) 이내 들어오면 그 순간 GPS 좌표를
+                 앵커로 고정하고 HOLD로 전환 - 라이다는 여기서 역할 끝.
+      HOLD     : 라이다 더 이상 안 봄. 고정된 GPS 앵커 기준으로 회전 없이
+                 앞/뒤로만 고정된 힘(FIXED_PUSH_LINEAR)으로 미는 방식으로
+                 유지 - 실측(hold_position.py)으로 급류에서도 효과 확인됨.
+                 데드밴드 안에서 5초 연속 버티면 성공, m2e로 이동 후 done.
     """
 
     MY_MISSION = 'mission_2'
 
-    TARGET_DIST = 5.0
-    DEADBAND = 1.0
-    OUTER_HYSTERESIS = 0.5
-    HOLD_SECONDS = 5.0
+    # ---- APPROACH(라이다) ----
+    TARGET_DIST = 5.0            # 이 거리 이내 들어오면 앵커 고정하고 HOLD 전환
     FORWARD_CONE_DEG = 90.0
     LOCK_SWITCH_RADIUS_DEG = 15.0
-    SEARCH_CRAWL_SPEED = 0.15
+    APPROACH_CRAWL_SPEED = 0.15  # 부표 안 보일 때 천천히 탐색 전진
+    APPROACH_LINEAR_MAX = 0.3
+    APPROACH_K_LINEAR = 0.15
+    APPROACH_K_ANGULAR = 0.02
     CLUSTER_JUMP_THRESHOLD = 0.3
+
+    # ---- HOLD(GPS, 실측 검증된 값) ----
+    DEADBAND_M = 0.5
+    OUTER_HYSTERESIS_M = 0.5
+    HOLD_SECONDS = 5.0
+    FIXED_PUSH_LINEAR = 0.35   # 오늘 실측으로 확정된 값
 
     def __init__(self):
         super().__init__('mission_2')
@@ -40,7 +52,10 @@ class Mission2(Node):
         self.current_lat = None
         self.current_lon = None
 
-        self.locked_target = None
+        self.locked_target = None   # 라이다 클러스터 (APPROACH 단계용)
+        self.anchor_lat = None      # HOLD 단계에서 쓸 GPS 앵커
+        self.anchor_lon = None
+
         self.holding = False
         self.hold_start_time = None
         self.exiting = False
@@ -56,7 +71,8 @@ class Mission2(Node):
         self.done_pub = self.create_publisher(String, 'mission/done', 10)
 
         self.timer = self.create_timer(0.1, self.control_loop)
-        self.get_logger().info('mission_2(위치유지) 노드 시작 - 부표 5m 이내 5초 정지유지')
+        self.get_logger().info(
+            'mission_2(위치유지) 노드 시작 - 라이다로 접근, GPS로 유지(3단계)')
 
     def active_cb(self, msg):
         self.active = (msg.data == self.MY_MISSION)
@@ -65,6 +81,8 @@ class Mission2(Node):
         if msg.data == self.MY_MISSION:
             self.phase = 'MOVING'
             self.locked_target = None
+            self.anchor_lat = None
+            self.anchor_lon = None
             self.holding = False
             self.hold_start_time = None
             self.exiting = False
@@ -83,7 +101,8 @@ class Mission2(Node):
             pass
 
     def scan_cb(self, msg):
-        if not self.active or self.exiting or self.phase != 'TASK':
+        # 라이다는 APPROACH 단계에서만 씀 - MOVING/HOLD에서는 무시
+        if not self.active or self.exiting or self.phase != 'APPROACH':
             return
 
         n = len(msg.ranges)
@@ -124,7 +143,10 @@ class Mission2(Node):
             self.run_exit()
             return
 
-        self.run_task()
+        if self.phase == 'APPROACH':
+            self.run_approach()
+        elif self.phase == 'HOLD':
+            self.run_hold()
 
     def run_moving(self):
         if self.current_lat is None:
@@ -146,63 +168,86 @@ class Mission2(Node):
             self.cmd_pub.publish(cmd)
             return
 
-        self.get_logger().info('m2s 도착 - 위치유지 TASK로 전환')
-        self.phase = 'TASK'
+        self.get_logger().info('m2s 도착 - 라이다 접근(APPROACH) 시작')
+        self.phase = 'APPROACH'
 
-    def run_task(self):
+    def run_approach(self):
+        """라이다로 부표까지 접근. TARGET_DIST 이내 들어오면 그 순간 GPS 좌표를
+        앵커로 고정하고 HOLD로 전환 - 이후로는 라이다 값 안 씀."""
+        cmd = Twist()
+
         if self.locked_target is None:
-            cmd = Twist()
-            cmd.linear.x = self.SEARCH_CRAWL_SPEED
+            cmd.linear.x = self.APPROACH_CRAWL_SPEED
             self.cmd_pub.publish(cmd)
             return
 
         r = self.locked_target['range']
         bearing_rel = self.locked_target['bearing']
 
-        if self.current_heading is not None:
-            h_msg = Float32()
-            h_msg.data = (self.current_heading + bearing_rel) % 360.0
-            self.heading_pub.publish(h_msg)
+        if r <= self.TARGET_DIST:
+            if self.current_lat is None:
+                self.get_logger().warn('목표거리 도달했지만 GPS 없음 - 앵커 고정 대기', throttle_duration_sec=2.0)
+                self.cmd_pub.publish(Twist())
+                return
+            self.anchor_lat = self.current_lat
+            self.anchor_lon = self.current_lon
+            self.get_logger().info(
+                f'★ 목표거리({self.TARGET_DIST}m) 도달 - GPS 앵커 고정: '
+                f'({self.anchor_lat:.8f}, {self.anchor_lon:.8f}) - HOLD 전환 ★')
+            self.phase = 'HOLD'
+            self.cmd_pub.publish(Twist())
+            return
 
         error = r - self.TARGET_DIST
-        cmd = Twist()
-        if abs(error) <= self.DEADBAND / 2.0:
-            cmd.linear.x = 0.0
-        else:
-            K = 0.15
-            cmd.linear.x = max(-0.3, min(0.3, K * error))
-        cmd.angular.z = max(-0.5, min(0.5, 0.02 * bearing_rel))
+        cmd.linear.x = max(0.0, min(self.APPROACH_LINEAR_MAX, self.APPROACH_K_LINEAR * error))
+        cmd.angular.z = max(-0.5, min(0.5, self.APPROACH_K_ANGULAR * bearing_rel))
         self.cmd_pub.publish(cmd)
 
-        self.update_hold_timer(r)
+    def run_hold(self):
+        """실측 검증된 방식: 회전 없이, 앵커가 배 앞쪽에 있으면 전진, 뒤쪽이면 후진.
+        데드밴드+히스테리시스로 5초 연속 유지 확인."""
+        cmd = Twist()
 
-    def update_hold_timer(self, r):
-        outer_limit = self.TARGET_DIST + self.OUTER_HYSTERESIS
-        inner_ok = r <= self.TARGET_DIST
+        if self.current_lat is None or self.current_heading is None or self.anchor_lat is None:
+            self.cmd_pub.publish(cmd)
+            return
 
+        bearing = self.bearing_deg(self.current_lat, self.current_lon, self.anchor_lat, self.anchor_lon)
+        dist = self.distance_m(self.current_lat, self.current_lon, self.anchor_lat, self.anchor_lon)
+        heading_error = self.normalize_angle(bearing - self.current_heading)
+
+        outer_limit = self.DEADBAND_M + self.OUTER_HYSTERESIS_M
         if not self.holding:
-            if inner_ok:
+            if dist <= self.DEADBAND_M:
                 self.holding = True
                 self.hold_start_time = self.get_clock().now()
-                self.get_logger().info('5m 이내 진입 - 5초 유지 타이머 시작')
-            return
+                self.get_logger().info('데드밴드 진입 - 5초 유지 타이머 시작')
+        else:
+            if dist > outer_limit:
+                self.holding = False
+                self.hold_start_time = None
+                self.get_logger().warn(f'{outer_limit}m 밖으로 이탈 - 타이머 리셋')
 
-        if r > outer_limit:
-            self.holding = False
-            self.hold_start_time = None
-            self.get_logger().warn(f'{outer_limit}m 밖으로 이탈 - 타이머 리셋')
-            return
+        if dist <= self.DEADBAND_M:
+            cmd.linear.x = 0.0
+        elif abs(heading_error) <= 90.0:
+            cmd.linear.x = self.FIXED_PUSH_LINEAR      # 앵커가 앞쪽 -> 전진
+        else:
+            cmd.linear.x = -self.FIXED_PUSH_LINEAR     # 앵커가 뒤쪽 -> 후진
+        cmd.angular.z = 0.0
+        self.cmd_pub.publish(cmd)
 
-        elapsed = (self.get_clock().now() - self.hold_start_time).nanoseconds / 1e9
-        if elapsed >= self.HOLD_SECONDS:
-            self.get_logger().info('mission_2 5초 위치유지 성공')
-            self.holding = False
-            end_point = MISSION_TARGETS.get('m2e')
-            if end_point is not None:
-                self.exiting = True
-                self.get_logger().info('m2e로 이동 시작')
-            else:
-                self.finish()
+        if self.holding and self.hold_start_time is not None:
+            elapsed = (self.get_clock().now() - self.hold_start_time).nanoseconds / 1e9
+            if elapsed >= self.HOLD_SECONDS:
+                self.get_logger().info('mission_2 5초 위치유지 성공')
+                self.holding = False
+                end_point = MISSION_TARGETS.get('m2e')
+                if end_point is not None:
+                    self.exiting = True
+                    self.get_logger().info('m2e로 이동 시작')
+                else:
+                    self.finish()
 
     def run_exit(self):
         point = MISSION_TARGETS.get('m2e')
@@ -225,6 +270,13 @@ class Mission2(Node):
         done = String()
         done.data = self.MY_MISSION
         self.done_pub.publish(done)
+
+    def normalize_angle(self, angle_deg):
+        while angle_deg > 180.0:
+            angle_deg -= 360.0
+        while angle_deg < -180.0:
+            angle_deg += 360.0
+        return angle_deg
 
     def cluster_scan(self, ranges, angles, range_min, range_max, max_range):
         """연속된 유효 거리값들을 클러스터로 묶는다.
