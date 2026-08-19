@@ -7,7 +7,7 @@ from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
 from rclpy.qos import qos_profile_sensor_data
 
-from kaboat_navigation.field_config import MISSION_TARGETS, TRANSIT_ARRIVAL_RADIUS_M
+from kaboat_navigation.field_config import MISSION_TARGETS
 
 
 def bearing_deg(lat1, lon1, lat2, lon2):
@@ -107,14 +107,12 @@ def fuse_vision_lidar(candidates, clusters, max_bearing_diff_deg=8.0):
 
 class GatePositionMemory:
     """이미 통과한 게이트의 절대좌표(lat, lon)를 기억해서, 회피기동으로
-    돌아섰다가 다시 같은 게이트를 근접후보로 잡아 중복 카운트하는 것을 방지.
-    Mission5(Node)가 아닌 별도 클래스라 bearing_deg/distance_m을 클래스
-    내부 staticmethod가 아닌 모듈 함수로 둔 것(Mission5와 공유하기 위함)."""
+    돌아섰다가 다시 같은 게이트를 근접후보로 잡아 중복 카운트하는 것을 방지."""
 
     SAME_GATE_RADIUS_M = 3.0
 
     def __init__(self):
-        self.passed_positions = []  # [(lat, lon), ...]
+        self.passed_positions = []
 
     def is_already_passed(self, lat, lon):
         for plat, plon in self.passed_positions:
@@ -133,13 +131,25 @@ class Mission5(Node):
     순서대로 통과해야 함. 게이트 이탈/충돌 시 패널티.
 
     흐름:
-      MOVING : m5s로 이동하며 게이트 탐색 대기
+      MOVING : m5s로 이동 (leg 이동 - 아래 설명). 도착 후 게이트 탐색 대기.
       TASK   : 전방 콘(±80도) 안 red/green 각각 최근접 1개 검출 -> LiDAR로
                range/bearing 정밀보정(fuse_vision_lidar) -> 중간 방위각/거리를
-               게이트 중심으로 삼아 조향. GPS로 이미 통과한 게이트를 기억해
-               중복 카운트 방지(GatePositionMemory). 거리가 최소값을 찍고
-               다시 멀어지면 통과 판정.
-      EXIT   : 게이트가 3초간 안 보이고 1개 이상 통과했으면 m5e로 이동 후 done
+               게이트 중심으로 삼아 조향(건드리지 않음 - 실시간 추적).
+               GPS로 이미 통과한 게이트를 기억해 중복 카운트 방지. 거리가
+               최소값을 찍고 다시 멀어지면 통과 판정.
+      EXIT   : 게이트가 3초간 안 보이고 1개 이상 통과했으면 m5e로 이동(leg 이동)
+               후 done. 실제 장애물회피는 avoidance.py + arbiter가 전담,
+               여기선 목표방향(goal/heading)만 계속 발행.
+
+    --- 좌표이동(leg) 로직 (mission0/1/3/4.py와 동일 원칙) ---
+    MOVING/EXIT처럼 "GPS 좌표 하나로 이동"하는 구간에만 적용. TASK(게이트
+    실시간추적)는 이 로직과 무관 - buoys_cb 그대로 둠.
+      REACQUIRE: 정지+SOL확보 대기 -> 방위각/조향 커밋(전진+회전 같이).
+      CRUISE   : 커밋값 유지, 거리만 체크. 오버슈트(7초 유예 후 재이탈)시 ALIGN.
+      ALIGN    : 전진없이 제자리회전만으로 목표방향 재조준(±15도) 후 CRUISE 복귀.
+      도착 후 3초 정지 후 다음 단계.
+    (avoidance.py는 goal/heading을 매 tick 재계산 안 해도 이미 기준방향으로만
+    쓰므로, MOVING/EXIT가 이동 중 방향을 안 바꿔도 회피 성능엔 영향 없음.)
 
     camera/detections(camera_node.py 발행, color 'R'/'G'/'B' + angle(rad))를
     게이트 판정용 형식(color 'red'/'green' + bearing_deg(도))으로 변환해서 사용.
@@ -150,9 +160,17 @@ class Mission5(Node):
     FORWARD_CONE_DEG = 80.0
     NO_GATE_TIMEOUT = 3.0
 
-    # camera_node.py의 color 코드('R'/'G'/'B') -> 게이트 판정용 색상명.
-    # 파랑(B)은 게이트와 무관하므로 매핑에서 제외 -> 자동으로 걸러짐.
     CAMERA_COLOR_MAP = {'R': 'red', 'G': 'green'}
+
+    # ---- leg 이동(MOVING/EXIT 공용) ----
+    LEG_ARRIVAL_RADIUS_M = 1.0
+    LEG_OVERSHOOT_MARGIN_M = 0.5
+    LEG_MIN_OVERSHOOT_CHECK_SEC = 7.0
+    LEG_CRUISE_LINEAR = 0.4
+    LEG_ANGULAR_MAX = 1.0
+    LEG_K_ANGULAR = 0.6
+    LEG_ALIGN_TOLERANCE_DEG = 15.0
+    LEG_ARRIVAL_PAUSE_SEC = 3.0
 
     def __init__(self):
         super().__init__('mission_5')
@@ -161,6 +179,7 @@ class Mission5(Node):
         self.current_heading = None
         self.current_lat = None
         self.current_lon = None
+        self._fix_this_tick = False
 
         self.gate_count = 0
         self.tracking_min_dist = None
@@ -169,6 +188,18 @@ class Mission5(Node):
         self.latest_clusters = []
         self.gate_memory = GatePositionMemory()
         self.pending_gate_pos = None
+
+        # leg 이동 상태
+        self._leg_state = None
+        self._leg_target = None
+        self._leg_committed_linear = 0.0
+        self._leg_committed_angular = 0.0
+        self._leg_min_dist = None
+        self._leg_cruise_start = None
+
+        self._pause_active = False
+        self._pause_start = None
+        self._pause_next_phase = None
 
         self.create_subscription(String, 'mission/active', self.active_cb, 10)
         self.create_subscription(String, 'mission/started', self.started_cb, 10)
@@ -196,6 +227,8 @@ class Mission5(Node):
             self.exiting = False
             self.gate_memory = GatePositionMemory()
             self.pending_gate_pos = None
+            self._leg_state = None
+            self._pause_active = False
             self.get_logger().info('mission_5 시작 - 상태 초기화')
 
     def scan_cb(self, msg):
@@ -214,19 +247,19 @@ class Mission5(Node):
                 elif part.startswith('imu_heading='):
                     self.current_heading = float(part.split('=')[1])
         except (ValueError, IndexError):
-            pass
+            return
+        if self.current_lat is not None and self.current_heading is not None:
+            self._fix_this_tick = True
 
     def buoys_cb(self, msg):
-        if not self.active or self.exiting:
+        # 게이트 실시간 추적(TASK) - 그대로 둠, leg 이동과 무관
+        if not self.active or self.exiting or self.phase != 'TASK':
             return
         try:
             detections = json.loads(msg.data)
         except json.JSONDecodeError:
             return
 
-        # camera_node.py 실제 스키마({'color','angle'(rad),'distance'(옵션)})를
-        # 기존 로직이 기대하던 형식({'color':'red'/'green','bearing_deg'(deg),
-        # 'range_m'})으로 변환
         buoys = []
         for d in detections:
             color = self.CAMERA_COLOR_MAP.get(d.get('color'))
@@ -288,57 +321,172 @@ class Mission5(Node):
         if not self.active:
             return
 
+        if self._pause_active:
+            self._tick_pause()
+            self._fix_this_tick = False
+            return
+
         if self.exiting:
             self.run_exit()
+            self._fix_this_tick = False
             return
 
         if self.last_gate_seen_time is None:
             self.run_moving()
+            self._fix_this_tick = False
             return
 
         elapsed = (self.get_clock().now() - self.last_gate_seen_time).nanoseconds / 1e9
         if elapsed > self.NO_GATE_TIMEOUT and self.gate_count >= 1:
-            self.get_logger().info(f'게이트 안 보임({elapsed:.1f}s) - 종료지점으로 이동 시작')
-            self.phase = 'EXIT'
+            self.get_logger().info(f'게이트 안 보임({elapsed:.1f}s) - 정지 후 종료지점으로 이동')
             self.exiting = True
             self.last_gate_seen_time = None
+            self._leg_state = None
+            self._start_pause(next_phase='EXIT_ENTER')  # 실제 phase 전환은 pause 종료 후
+
+        self._fix_this_tick = False
 
     def run_moving(self):
-        point = MISSION_TARGETS.get('m5s')
-        if point is None:
+        target = MISSION_TARGETS.get('m5s')
+        if target is None:
             self.get_logger().warn('m5s 좌표 없음 (field_config.py 확인)', throttle_duration_sec=5.0)
             return
-        if self.current_lat is None:
-            return
-
-        dist_to_point = distance_m(self.current_lat, self.current_lon, point[0], point[1])
-        if dist_to_point > TRANSIT_ARRIVAL_RADIUS_M:
-            brg = bearing_deg(self.current_lat, self.current_lon, point[0], point[1])
-            h_msg = Float32()
-            h_msg.data = brg
-            self.heading_pub.publish(h_msg)
-            cmd = Twist()
-            cmd.linear.x = 0.2
-            self.cmd_pub.publish(cmd)
+        if self._leg_state is None:
+            self._leg_start(*target)
+        result = self._leg_tick()
+        if result == 'ARRIVED':
+            self.get_logger().info('m5s 도착 - 게이트 탐색 대기 (TASK는 buoys_cb가 자동 시작)')
+            # phase는 MOVING 유지 - buoys_cb가 게이트 잡으면 스스로 TASK로 전환함
+            self._leg_state = 'DONE_WAIT_GATE'  # leg 재실행 안 되게 막기용
 
     def run_exit(self):
-        point = MISSION_TARGETS.get('m5e')
-        if point is not None and self.current_lat is not None:
-            dist_to_point = distance_m(self.current_lat, self.current_lon, point[0], point[1])
-            if dist_to_point > TRANSIT_ARRIVAL_RADIUS_M:
-                brg = bearing_deg(self.current_lat, self.current_lon, point[0], point[1])
-                h_msg = Float32()
-                h_msg.data = brg
-                self.heading_pub.publish(h_msg)
-                cmd = Twist()
-                cmd.linear.x = 0.2
-                self.cmd_pub.publish(cmd)
-                return
+        target = MISSION_TARGETS.get('m5e')
+        if target is None:
+            self.get_logger().warn('m5e 좌표 없음 (field_config.py 확인)', throttle_duration_sec=5.0)
+            return
+        if self._leg_state is None or self._leg_state == 'DONE_WAIT_GATE':
+            self._leg_start(*target)
+        result = self._leg_tick()
+        if result == 'ARRIVED':
+            self.get_logger().info('mission_5 완료')
+            self.cmd_pub.publish(Twist())
+            done = String()
+            done.data = self.MY_MISSION
+            self.done_pub.publish(done)
 
-        self.get_logger().info('mission_5 완료')
-        done = String()
-        done.data = self.MY_MISSION
-        self.done_pub.publish(done)
+    # ==== 좌표이동(leg) 로직 - mission0/1/3/4.py와 동일 ====
+
+    def _leg_start(self, target_lat, target_lon):
+        self._leg_target = (target_lat, target_lon)
+        self._leg_state = 'REACQUIRE'
+        self._leg_committed_linear = 0.0
+        self._leg_committed_angular = 0.0
+        self._leg_min_dist = None
+        self._leg_cruise_start = None
+
+    def _leg_tick(self):
+        if self._leg_state in (None, 'DONE_WAIT_GATE'):
+            return 'WAITING'
+
+        if self._leg_state == 'REACQUIRE':
+            self.cmd_pub.publish(Twist())
+            if not self._fix_this_tick or self.current_lat is None:
+                return 'WAITING'
+            return self._leg_commit_and_cruise()
+
+        if self._leg_state == 'ALIGN':
+            if not self._fix_this_tick or self.current_lat is None:
+                self.cmd_pub.publish(Twist())
+                return 'WAITING'
+            bearing = bearing_deg(self.current_lat, self.current_lon, *self._leg_target)
+            heading_error = self.normalize_angle_deg(bearing - self.current_heading)
+            self.publish_goal_heading(bearing)
+            if abs(heading_error) <= self.LEG_ALIGN_TOLERANCE_DEG:
+                self._leg_committed_linear = self.LEG_CRUISE_LINEAR
+                self._leg_committed_angular = 0.0
+                self._leg_min_dist = None
+                self._leg_cruise_start = self.get_clock().now()
+                self._leg_state = 'CRUISE'
+                return 'MOVING'
+            cmd = Twist()
+            cmd.angular.z = max(-self.LEG_ANGULAR_MAX,
+                                 min(self.LEG_ANGULAR_MAX, self.LEG_K_ANGULAR * math.radians(heading_error)))
+            self.cmd_pub.publish(cmd)
+            return 'MOVING'
+
+        if self._leg_state == 'CRUISE':
+            if self.current_lat is None:
+                self._leg_publish_cmd()
+                return 'MOVING'
+            dist = distance_m(self.current_lat, self.current_lon, *self._leg_target)
+            if dist <= self.LEG_ARRIVAL_RADIUS_M:
+                self.cmd_pub.publish(Twist())
+                self._leg_state = None
+                return 'ARRIVED'
+            if self._leg_min_dist is None or dist < self._leg_min_dist:
+                self._leg_min_dist = dist
+            else:
+                elapsed = ((self.get_clock().now() - self._leg_cruise_start).nanoseconds / 1e9
+                           if self._leg_cruise_start else 0.0)
+                if elapsed >= self.LEG_MIN_OVERSHOOT_CHECK_SEC and dist > self._leg_min_dist + self.LEG_OVERSHOOT_MARGIN_M:
+                    self.get_logger().warn(
+                        f'오버슈트 감지(최소 {self._leg_min_dist:.2f}m -> {dist:.2f}m) - 정지 후 재정렬')
+                    self.cmd_pub.publish(Twist())
+                    self._leg_state = 'ALIGN'
+                    return 'MOVING'
+            self._leg_publish_cmd()
+            return 'MOVING'
+
+        return 'WAITING'
+
+    def _leg_commit_and_cruise(self):
+        dist = distance_m(self.current_lat, self.current_lon, *self._leg_target)
+        if dist <= self.LEG_ARRIVAL_RADIUS_M:
+            self._leg_state = None
+            return 'ARRIVED'
+        bearing = bearing_deg(self.current_lat, self.current_lon, *self._leg_target)
+        heading_error = self.normalize_angle_deg(bearing - self.current_heading)
+        self.publish_goal_heading(bearing)
+        self._leg_committed_linear = self.LEG_CRUISE_LINEAR
+        self._leg_committed_angular = max(-self.LEG_ANGULAR_MAX,
+                                           min(self.LEG_ANGULAR_MAX, self.LEG_K_ANGULAR * math.radians(heading_error)))
+        self._leg_min_dist = None
+        self._leg_cruise_start = self.get_clock().now()
+        self._leg_state = 'CRUISE'
+        return 'MOVING'
+
+    def _leg_publish_cmd(self):
+        cmd = Twist()
+        cmd.linear.x = self._leg_committed_linear
+        cmd.angular.z = self._leg_committed_angular
+        self.cmd_pub.publish(cmd)
+
+    def _start_pause(self, next_phase):
+        self.cmd_pub.publish(Twist())
+        self._pause_active = True
+        self._pause_start = self.get_clock().now()
+        self._pause_next_phase = next_phase
+
+    def _tick_pause(self):
+        self.cmd_pub.publish(Twist())
+        elapsed = (self.get_clock().now() - self._pause_start).nanoseconds / 1e9
+        if elapsed >= self.LEG_ARRIVAL_PAUSE_SEC:
+            self._pause_active = False
+            self._leg_state = None
+            # EXIT_ENTER는 실제 phase 이름이 아니라 그냥 pause 후 run_exit로
+            # 자연스럽게 흘러가게 하는 표식 - exiting=True는 이미 설정돼있음.
+
+    def publish_goal_heading(self, deg):
+        h = Float32()
+        h.data = deg
+        self.heading_pub.publish(h)
+
+    def normalize_angle_deg(self, angle_deg):
+        while angle_deg > 180.0:
+            angle_deg -= 360.0
+        while angle_deg < -180.0:
+            angle_deg += 360.0
+        return angle_deg
 
 
 def main(args=None):
