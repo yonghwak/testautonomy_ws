@@ -21,9 +21,16 @@ class Mission2(Node):
                  목표거리(TARGET_DIST) 이내 들어오면 그 순간 GPS 좌표를
                  앵커로 고정하고 HOLD로 전환 - 라이다는 여기서 역할 끝.
       HOLD     : 라이다 더 이상 안 봄. 고정된 GPS 앵커 기준으로 회전 없이
-                 앞/뒤로만 고정된 힘(FIXED_PUSH_LINEAR)으로 미는 방식으로
-                 유지 - 실측(hold_position.py)으로 급류에서도 효과 확인됨.
+                 앞/뒤로만 고정된 힘으로 미는 방식으로 유지 - 실측 검증됨.
                  데드밴드 안에서 5초 연속 버티면 성공, m2e로 이동 후 done.
+
+    실측으로 확정된 것들:
+    - 회전 넣으면 SOL_COMPUTED가 이동 중 자주 풀려서 헤딩값이 튀고, 그 결과
+      배가 좌우로 급하게 흔들리며 오히려 더 밀려나는 현상 확인됨 -> HOLD 단계는
+      회전(angular.z) 없이 전/후진만으로 제어.
+    - 전진/후진 힘을 다르게 줌(급류가 배를 뒤로 미는 상황이라 후진 보정은 더 약하게).
+    - 좌우 밀림은 회전 없이는 원천적으로 못 잡음 -> 규정(5m 이내) 여유를 감안해
+      DEADBAND_M을 넉넉하게 잡아서 "그 정도는 유지 성공으로 인정"하는 방식으로 우회.
     """
 
     MY_MISSION = 'mission_2'
@@ -38,11 +45,12 @@ class Mission2(Node):
     APPROACH_K_ANGULAR = 0.02
     CLUSTER_JUMP_THRESHOLD = 0.3
 
-    # ---- HOLD(GPS, 실측 검증된 값) ----
-    DEADBAND_M = 0.5
+    # ---- HOLD(GPS, 실측 확정값) ----
+    DEADBAND_M = 2.0            # 좌우밀림은 회전없이 못 잡아서 규정(5m) 여유 감안해 넉넉하게
     OUTER_HYSTERESIS_M = 0.5
     HOLD_SECONDS = 5.0
-    FIXED_PUSH_LINEAR = 0.35   # 오늘 실측으로 확정된 값
+    PUSH_FORWARD_LINEAR = 0.2    # 앵커가 앞쪽일 때
+    PUSH_BACKWARD_LINEAR = 0.15  # 앵커가 뒤쪽일 때(급류가 뒤로 밀어줘서 더 약하게)
 
     def __init__(self):
         super().__init__('mission_2')
@@ -205,7 +213,8 @@ class Mission2(Node):
 
     def run_hold(self):
         """실측 검증된 방식: 회전 없이, 앵커가 배 앞쪽에 있으면 전진, 뒤쪽이면 후진.
-        데드밴드+히스테리시스로 5초 연속 유지 확인."""
+        전/후진 힘은 서로 다르게(급류 방향 고려). 데드밴드+히스테리시스로
+        5초 연속 유지 확인."""
         cmd = Twist()
 
         if self.current_lat is None or self.current_heading is None or self.anchor_lat is None:
@@ -231,9 +240,9 @@ class Mission2(Node):
         if dist <= self.DEADBAND_M:
             cmd.linear.x = 0.0
         elif abs(heading_error) <= 90.0:
-            cmd.linear.x = self.FIXED_PUSH_LINEAR      # 앵커가 앞쪽 -> 전진
+            cmd.linear.x = self.PUSH_FORWARD_LINEAR    # 앵커가 앞쪽 -> 전진
         else:
-            cmd.linear.x = -self.FIXED_PUSH_LINEAR     # 앵커가 뒤쪽 -> 후진
+            cmd.linear.x = -self.PUSH_BACKWARD_LINEAR  # 앵커가 뒤쪽 -> 후진
         cmd.angular.z = 0.0
         self.cmd_pub.publish(cmd)
 
